@@ -9,17 +9,18 @@ import tempfile
 from uuid import uuid4
 
 import math
-import numpy as np
 import logging
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import AnyHttpUrl, BaseModel
 
+_tf_import_error: Optional[Exception] = None
 try:
     import essentia.standard as es  # type: ignore[import]
     try:
         import essentia.tensorflow  # type: ignore[import]  # register TF algorithms if available
-    except Exception:
-        pass
+    except Exception as exc:  # capture TensorFlow plugin import failures
+        _tf_import_error = exc
 except ImportError:  # Essentia may not be installed yet
     es = None  # type: ignore[assignment]
 
@@ -62,6 +63,8 @@ TF_LABELS_PATH = os.getenv("ESSENTIA_TF_MODEL_LABELS")
 logger = logging.getLogger("essentia_service")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+if _tf_import_error is not None:
+    logger.warning("Failed to load essentia.tensorflow plugin: %s", _tf_import_error)
 logger.info(
     "TF config: model=%s exists=%s labels=%s labels_exists=%s has_muscinn=%s has_predict=%s",
     TF_MODEL_PATH,

@@ -24,6 +24,8 @@ RUN curl -L \
    && pip install /tmp/essentia-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl /tmp/essentia_tensorflow-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl \
    && rm -f /tmp/essentia-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl /tmp/essentia_tensorflow-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.9/site-packages/essentia_tensorflow:$LD_LIBRARY_PATH
+
 COPY . .
 
 # Environment defaults for TensorFlow tagger; override in Render if paths differ
