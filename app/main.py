@@ -18,9 +18,13 @@ _tf_import_error: Optional[Exception] = None
 try:
     import essentia.standard as es  # type: ignore[import]
     try:
-        import essentia.tensorflow  # type: ignore[import]  # register TF algorithms if available
-    except Exception as exc:  # capture TensorFlow plugin import failures
-        _tf_import_error = exc
+        import essentia_tensorflow  # type: ignore[import]  # register TF algorithms if available
+    except Exception:
+        # Some wheels expose the plugin as essentia.tensorflow instead
+        try:
+            import essentia.tensorflow  # type: ignore[import]
+        except Exception as exc:  # capture TensorFlow plugin import failures
+            _tf_import_error = exc
 except ImportError:  # Essentia may not be installed yet
     es = None  # type: ignore[assignment]
 
