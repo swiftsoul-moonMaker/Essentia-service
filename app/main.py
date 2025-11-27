@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import math
 import numpy as np
+import logging
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import AnyHttpUrl, BaseModel
 
@@ -54,6 +55,18 @@ ANALYZER_NAME = (
 )
 TF_MODEL_PATH = os.getenv("ESSENTIA_TF_MODEL")
 TF_LABELS_PATH = os.getenv("ESSENTIA_TF_MODEL_LABELS")
+logger = logging.getLogger("essentia_service")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+logger.info(
+    "TF config: model=%s exists=%s labels=%s labels_exists=%s has_muscinn=%s has_predict=%s",
+    TF_MODEL_PATH,
+    os.path.exists(TF_MODEL_PATH) if TF_MODEL_PATH else False,
+    TF_LABELS_PATH,
+    os.path.exists(TF_LABELS_PATH) if TF_LABELS_PATH else False,
+    hasattr(es, "TensorflowPredictMusiCNN") if es else False,
+    hasattr(es, "TensorflowPredict") if es else False,
+)
 
 app = FastAPI(
     title="Essentia Analysis Service",
@@ -226,10 +239,13 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
     # Tensorflow model-based tags (musicnn-style)
     def _tf_top_tags(audio_seq: Optional[List[float]]) -> Dict[str, Any]:
         if es is None or TF_MODEL_PATH is None or audio_seq is None:
-            return {"labels": [], "scores": [], "mood_labels": [], "shape": None, "error": None}
+            logger.warning("TF disabled or missing input: es=%s model=%s audio=%s", es is not None, TF_MODEL_PATH, audio_seq is not None)
+            return {"labels": [], "scores": [], "mood_labels": [], "shape": None, "error": "tf_disabled_or_no_audio"}
         if not os.path.exists(TF_MODEL_PATH):
+            logger.error("TF model not found at %s", TF_MODEL_PATH)
             return {"labels": [], "scores": [], "mood_labels": [], "shape": None, "error": "model_not_found"}
         if not (hasattr(es, "TensorflowPredictMusiCNN") or hasattr(es, "TensorflowPredict")):
+            logger.error("TensorflowPredict/TensorflowPredictMusiCNN not available in essentia build")
             return {
                 "labels": [],
                 "scores": [],
@@ -331,6 +347,7 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
                 "error": None,
             }
         except Exception as exc:
+            logger.exception("TF tagger error: %s", exc)
             return {
                 "labels": [],
                 "scores": [],
