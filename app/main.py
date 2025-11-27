@@ -16,6 +16,10 @@ from pydantic import AnyHttpUrl, BaseModel
 
 try:
     import essentia.standard as es  # type: ignore[import]
+    try:
+        import essentia.tensorflow  # type: ignore[import]  # register TF algorithms if available
+    except Exception:
+        pass
 except ImportError:  # Essentia may not be installed yet
     es = None  # type: ignore[assignment]
 
