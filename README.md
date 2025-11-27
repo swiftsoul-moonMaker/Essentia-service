@@ -26,6 +26,32 @@ status).
 5. Open http://127.0.0.1:8000/docs to explore the automatically
    generated OpenAPI/Swagger UI.
 
+### Run a one-off local extraction (no server)
+
+```
+python scripts/run_analysis.py path/to/audio.wav --track-id trk_123
+```
+Prints the same payload the API returns for `/analyze`.
+
+To enable TensorFlow-based high-level tags (musicnn), download a compatible model
+file (e.g., `msd-musicnn-discogs.pb`) and set:
+
+- `ESSENTIA_TF_MODEL=/path/to/msd-musicnn-1.pb`
+- optionally `ESSENTIA_TF_MODEL_LABELS=/path/to/msd-musicnn-1.json`
+
+Then start the server or run the local script; `tags.genres` will include the
+top model predictions.
+
+Example (macOS/Linux):
+
+```
+export ESSENTIA_TF_MODEL="$PWD/tensorflow-models/msd-musicnn-1.pb"
+export ESSENTIA_TF_MODEL_LABELS="$PWD/tensorflow-models/msd-musicnn-1.json"  # json with classes
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+If you only have a JSON with labels, point `ESSENTIA_TF_MODEL_LABELS` to it; the code will load a JSON array or a `{"labels": [...]}`/`{"classes": [...]}` object.
+
 ## API endpoints
 
 All responses are JSON.
@@ -45,6 +71,7 @@ Accepts `multipart/form-data` with:
 - `file`: binary audio file (mp3, wav, flac, etc.).
 - `source_url` (optional, string): placeholder for URL-based ingestion;
   not yet implemented in the starter code.
+- `track_id` (optional, string): identifier to attach to the analysis result.
 
 Returns a JSON object representing the job, including a `job_id` and a
 `status` field. In this starter stack the analysis runs synchronously,
@@ -99,9 +126,10 @@ your own legal counsel for production use.
 
 ## Notes
 
-- The `_extract_features` function in `app/main.py` is deliberately
-  minimal and only computes a simple energy feature. Extend this with
-  your actual Essentia-based feature extraction pipeline.
+- The `_extract_features` function in `app/main.py` uses Essentia's
+  `MusicExtractor` to derive tempo, key/mode, MFCCs, HPCP, spectral
+  descriptors, loudness, danceability, tags (if models are available),
+  and a deterministic embedding vector assembled from those features.
 - In-memory job storage is fine for development; for production, replace
   `_JOBS` with a durable store (SQL/NoSQL/Redis, etc.).
 - If you intend to consume this from an existing app, configure the base

@@ -2,5 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 essentia
+essentia-tensorflow
 numpy
 python-multipart
+

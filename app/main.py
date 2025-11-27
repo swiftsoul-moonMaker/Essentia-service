@@ -1,12 +1,14 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import os
+import json
 import shutil
 import tempfile
 from uuid import uuid4
 
+import math
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import AnyHttpUrl, BaseModel
@@ -47,6 +49,11 @@ class Meta(BaseModel):
 SERVICE_VERSION = "0.1.0"
 REPO_URL = "https://github.com/your-org/essentia-analysis-service"
 API_LICENSE = "AGPL-3.0-only"
+ANALYZER_NAME = (
+    f"essentia-{getattr(es, '__version__', '2.1-beta5')}" if es is not None else "essentia-missing"
+)
+TF_MODEL_PATH = os.getenv("ESSENTIA_TF_MODEL")
+TF_LABELS_PATH = os.getenv("ESSENTIA_TF_MODEL_LABELS")
 
 app = FastAPI(
     title="Essentia Analysis Service",
@@ -61,11 +68,11 @@ app = FastAPI(
 _JOBS: Dict[str, JobWithResult] = {}
 
 
-def _extract_features(audio_path: str) -> Dict[str, Any]:
+def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Minimal Essentia-based feature extraction.
+    Rich Essentia-based feature extraction using the built-in MusicExtractor.
 
-    Replace / extend this with whatever Essentia pipeline you actually need.
+    Returns a payload shaped for the external API contract (tempo, key, MFCCs, tags, etc.).
     """
     if es is None:
         raise RuntimeError(
@@ -73,16 +80,377 @@ def _extract_features(audio_path: str) -> Dict[str, Any]:
             "in this environment to enable feature extraction."
         )
 
-    loader = es.MonoLoader(filename=audio_path)
-    audio = loader()
+    # Load raw audio for RMS/energy and TensorFlow tagging
+    raw_loader = es.MonoLoader(filename=audio_path, sampleRate=44100)
+    raw_audio = raw_loader()
+    tf_audio: Optional[List[float]] = None
+    if TF_MODEL_PATH:
+        tf_loader = es.MonoLoader(filename=audio_path, sampleRate=16000)
+        tf_audio = list(tf_loader())
 
-    # Very simple example feature: total energy.
-    energy = float(np.sum(np.square(audio)))
+    # Run Essentia's high-level extractor (computes lowlevel, rhythm, tonal, and highlevel)
+    music_extractor = es.MusicExtractor(
+        lowlevelStats=["mean", "var"],
+        rhythmStats=["mean", "var"],
+        tonalStats=["mean", "var"],
+        analysisSampleRate=44100,
+    )
+    pool, audio = music_extractor(audio_path)
+    descriptor_names = set(pool.descriptorNames())
+
+    def _get(key: str, default: Any = None) -> Any:
+        try:
+            return pool[key]
+        except Exception:
+            return default
+
+    def _flatten_numeric(value: Any) -> List[float]:
+        """Return a flat list of floats, best-effort, ignoring non-numerics."""
+        out: List[float] = []
+
+        def _walk(v: Any) -> None:
+            if v is None:
+                return
+            if isinstance(v, (float, int, np.floating, np.integer)):
+                try:
+                    out.append(float(v))
+                except Exception:
+                    return
+                return
+            # Skip plain strings/bytes
+            if isinstance(v, (str, bytes)):
+                return
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    _walk(item)
+                return
+            if isinstance(v, np.ndarray):
+                for item in v.ravel():
+                    _walk(item)
+                return
+            if isinstance(v, dict):
+                for item in v.values():
+                    _walk(item)
+                return
+            # Generic iterable (e.g., Essentia vector types)
+            if hasattr(v, "__iter__"):
+                try:
+                    for item in v:
+                        _walk(item)
+                    return
+                except Exception:
+                    pass
+            try:
+                out.append(float(v))
+            except Exception:
+                return
+
+        _walk(value)
+        return out
+
+    def _to_scalar(value: Any, default: float = 0.0) -> float:
+        vals = _flatten_numeric(value)
+        if not vals:
+            return float(default)
+        return float(vals[0])
+
+    # Helper functions for shaping values
+    def _safe_mean(values: Any) -> float:
+        arr = _flatten_numeric(values)
+        return float(sum(arr) / len(arr)) if len(arr) else 0.0
+
+    def _swing(beats: List[float]) -> float:
+        if len(beats) < 3:
+            return 0.0
+        intervals = [beats[i + 1] - beats[i] for i in range(len(beats) - 1)]
+        odd = intervals[0::2]
+        even = intervals[1::2]
+        if not odd or not even:
+            return 0.0
+        odd_mean = sum(odd) / len(odd)
+        even_mean = sum(even) / len(even)
+        denom = max((odd_mean + even_mean) / 2.0, 1e-9)
+        return float(abs(odd_mean - even_mean) / denom)
+
+    def _top_labels(probabilities: Dict[str, float], k: int = 2) -> List[str]:
+        return [label for label, _ in sorted(probabilities.items(), key=lambda kv: kv[1], reverse=True)[:k]]
+
+    # Core scalar features
+    tempo = _to_scalar(_get("rhythm.bpm", 0.0))
+    beat_strength = _safe_mean(_flatten_numeric(_get("rhythm.beats_loudness", [])))
+    swing = _swing(_flatten_numeric(_get("rhythm.beats_position", [])))
+    danceability = _to_scalar(_get("rhythm.danceability", 0.0))
+
+    key_key = _get("tonal.key_key", "C")
+    key_scale = _get("tonal.key_scale", "major")
+    key_strength = _to_scalar(_get("tonal.key_strength", 0.0))
+    key_map = {
+        "C": 0,
+        "C#": 1,
+        "Db": 1,
+        "D": 2,
+        "D#": 3,
+        "Eb": 3,
+        "E": 4,
+        "F": 5,
+        "F#": 6,
+        "Gb": 6,
+        "G": 7,
+        "G#": 8,
+        "Ab": 8,
+        "A": 9,
+        "A#": 10,
+        "Bb": 10,
+        "B": 11,
+    }
+    key = key_map.get(str(key_key), 0)
+    mode = 1 if str(key_scale).lower() == "major" else 0
+
+    hpcp_mean = [float(x) for x in _flatten_numeric(_get("tonal.hpcp.mean", []))]
+    mfcc_mean = [float(x) for x in _flatten_numeric(_get("lowlevel.mfcc.mean", []))]
+    mfcc_var = [float(x) for x in _flatten_numeric(_get("lowlevel.mfcc.var", []))]
+
+    spectral_centroid = _to_scalar(_get("lowlevel.spectral_centroid.mean", 0.0))
+    brightness = _to_scalar(
+        _get("lowlevel.spectral_energyband_high.mean", spectral_centroid)
+    )
+
+    # Loudness and energy from raw audio
+    audio_vals = _flatten_numeric(raw_audio)
+    sum_sq = sum(x * x for x in audio_vals)
+    rms = float(math.sqrt(sum_sq / len(audio_vals)) if audio_vals else 0.0)
+    rms_loudness = float(20 * math.log10(max(rms, 1e-12)))  # dBFS-ish scalar
+    dynamic_range = _to_scalar(_get("dynamic_complexity", 0.0))
+    energy = float(sum_sq)
+
+    # Tensorflow model-based tags (musicnn-style)
+    def _tf_top_tags(audio_seq: Optional[List[float]]) -> Dict[str, Any]:
+        if es is None or TF_MODEL_PATH is None or audio_seq is None:
+            return {"labels": [], "scores": [], "mood_labels": [], "shape": None, "error": None}
+        if not os.path.exists(TF_MODEL_PATH):
+            return {"labels": [], "scores": [], "mood_labels": [], "shape": None, "error": "model_not_found"}
+        if not (hasattr(es, "TensorflowPredictMusiCNN") or hasattr(es, "TensorflowPredict")):
+            return {
+                "labels": [],
+                "scores": [],
+                "mood_labels": [],
+                "shape": None,
+                "error": "tensorflow_not_available_in_this_essentia_build",
+            }
+        try:
+            if hasattr(es, "TensorflowPredictMusiCNN"):
+                tf_predict = es.TensorflowPredictMusiCNN(
+                    graphFilename=TF_MODEL_PATH,
+                    output="model/Sigmoid",
+                )
+            else:
+                tf_predict = es.TensorflowPredict(
+                    graphFilename=TF_MODEL_PATH,
+                    input="model/Placeholder",
+                    output="model/Sigmoid",
+                    m2f="melspectrogram",
+                )
+
+            activations = tf_predict(np.asarray(audio_seq, dtype=np.float32))
+            act_arr = np.asarray(activations, dtype=np.float32)
+            if act_arr.ndim > 1:
+                act_arr = act_arr.mean(axis=0)
+            labels: List[str] = []
+            if TF_LABELS_PATH and os.path.exists(TF_LABELS_PATH):
+                if TF_LABELS_PATH.endswith(".json"):
+                    with open(TF_LABELS_PATH, "r", encoding="utf-8") as f:
+                        try:
+                            payload = json.load(f)
+                            if isinstance(payload, dict):
+                                if "labels" in payload:
+                                    payload = payload["labels"]
+                                elif "classes" in payload:
+                                    payload = payload["classes"]
+                            if isinstance(payload, list):
+                                labels = [str(x) for x in payload]
+                        except Exception:
+                            labels = []
+                else:
+                    with open(TF_LABELS_PATH, "r", encoding="utf-8") as f:
+                        labels = [line.strip() for line in f if line.strip()]
+            if not labels:
+                labels = [f"tag_{i}" for i in range(act_arr.shape[-1])]
+
+            all_scores = []
+            for i, lbl in enumerate(labels):
+                if i >= act_arr.shape[0]:
+                    break
+                all_scores.append({"label": lbl, "score": float(act_arr[i])})
+
+            top_idx = np.argsort(act_arr)[::-1][:5]
+            top_labels = [labels[i] for i in top_idx if i < len(labels)]
+            top_scores = [float(act_arr[i]) for i in top_idx if i < len(labels)]
+
+            # Mood-oriented labels across all outputs above a threshold
+            mood_keywords = {
+                "happy",
+                "sad",
+                "mellow",
+                "chill",
+                "chillout",
+                "beautiful",
+                "sexy",
+                "party",
+                "energetic",
+                "dark",
+                "aggressive",
+                "relaxing",
+                "calm",
+                "uplifting",
+                "melancholic",
+                "romantic",
+                "catchy",
+                "easy listening",
+            }
+            mood_candidates: List[Tuple[str, float]] = []
+            for i, lbl in enumerate(labels):
+                if i >= act_arr.shape[0]:
+                    continue
+                score = float(act_arr[i])
+                if lbl.lower().strip() in mood_keywords:
+                    mood_candidates.append((lbl, score))
+
+            # Always surface the top few mood-like labels, even if scores are low
+            mood_candidates.sort(key=lambda x: x[1], reverse=True)
+            mood_top = mood_candidates[:3]
+            mood_labels = [lbl for lbl, _ in mood_top]
+            mood_scores = [score for _, score in mood_top]
+
+            return {
+                "labels": top_labels,
+                "scores": top_scores,
+                "mood_labels": mood_labels,
+                "mood_scores": mood_scores,
+                "all_scores": all_scores,
+                "shape": list(act_arr.shape),
+                "error": None,
+            }
+        except Exception as exc:
+            return {
+                "labels": [],
+                "scores": [],
+                "mood_labels": [],
+                "mood_scores": [],
+                "all_scores": [],
+                "shape": None,
+                "error": str(exc),
+            }
+
+    # Tags from highlevel classifiers (if available)
+    tags: Dict[str, Any] = {"genres": [], "moods": [], "vocals": None, "instruments": []}
+
+    # Collect top labels from any highlevel.* descriptors that expose labels/probability
+    for name in descriptor_names:
+        if not name.startswith("highlevel.") or not name.endswith(".labels"):
+            continue
+        base = name[: -len(".labels")]
+        labels = _get(name, [])
+        probs = _get(f"{base}.probability", [])
+        if not labels:
+            continue
+        label_list = [str(lbl) for lbl in labels]
+        prob_list: List[float]
+        if isinstance(probs, dict):
+            prob_list = [float(probs.get(lbl, 0.0)) for lbl in label_list]
+        else:
+            flat_probs = _flatten_numeric(probs)
+            if len(flat_probs) >= len(label_list):
+                prob_list = [float(p) for p in flat_probs[: len(label_list)]]
+            else:
+                prob_list = [float(p) for p in flat_probs] + [0.0] * (
+                    len(label_list) - len(flat_probs)
+                )
+        pairs = list(zip(label_list, prob_list))
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        top_labels = [lbl for lbl, _ in pairs[:2]]
+        if "genre" in base:
+            tags["genres"].extend(top_labels)
+        elif "mood" in base:
+            tags["moods"].extend(top_labels)
+        elif "voice_instrumental" in base:
+            tags["vocals"] = "voice" in top_labels
+        else:
+            tags["instruments"].extend(top_labels)
+
+    # Voice/instrumental boolean fallback from value if available
+    vi_val = _get("highlevel.voice_instrumental.value", None)
+    if vi_val is not None:
+        tags["vocals"] = str(vi_val) == "voice"
+
+    # TensorFlow musicnn-style top tags appended to genres bucket
+    tf_tags = _tf_top_tags(tf_audio)
+    if tf_tags["labels"]:
+        tags["genres"].extend(tf_tags["labels"])
+    if tf_tags.get("mood_labels"):
+        tags["moods"].extend(tf_tags["mood_labels"])
+    tf_debug = {
+        "tf_model": TF_MODEL_PATH,
+        "tf_labels_file": TF_LABELS_PATH,
+        "tf_scores": tf_tags["scores"],
+        "tf_mood_labels": tf_tags.get("mood_labels", []),
+        "tf_mood_scores": tf_tags.get("mood_scores", []),
+        "tf_all_scores": tf_tags.get("all_scores", []),
+        "tf_shape": tf_tags.get("shape"),
+        "tf_error": tf_tags.get("error"),
+    }
+
+    # Deduplicate while keeping order
+    tags["genres"] = list(dict.fromkeys(tags["genres"]))
+    tags["moods"] = list(dict.fromkeys(tags["moods"]))
+    tags["instruments"] = list(dict.fromkeys(tags["instruments"]))
+
+    # Simple embedding built from stacked descriptors (real values, padded/truncated to 128 dims)
+    emb_components: List[float] = (
+        hpcp_mean
+        + mfcc_mean
+        + mfcc_var
+        + [
+            spectral_centroid,
+            brightness,
+            rms_loudness,
+            dynamic_range,
+            energy,
+            tempo,
+            beat_strength,
+            swing,
+            danceability,
+            key_strength,
+            float(mode),
+            float(key),
+        ]
+    )
+    if len(emb_components) >= 128:
+        embedding_list = emb_components[:128]
+    else:
+        embedding_list = emb_components + [0.0] * (128 - len(emb_components))
 
     return {
-        "backend": "essentia",
+        "trackId": track_id or os.path.splitext(os.path.basename(audio_path))[0],
+        "analyzer": ANALYZER_NAME,
         "features": {
+            "tempo": tempo,
+            "beat_strength": beat_strength,
+            "swing": swing,
+            "key": key,
+            "mode": mode,
+            "key_strength": key_strength,
+            "hpcp_mean": hpcp_mean,
+            "mfcc_mean": mfcc_mean,
+            "mfcc_var": mfcc_var,
+            "spectral_centroid": spectral_centroid,
+            "brightness": brightness,
+            "rms_loudness": rms_loudness,
+            "dynamic_range": dynamic_range,
             "energy": energy,
+            "danceability": danceability,
+            "tags": tags,
+            "debug": tf_debug,
+            "embedding": [float(x) for x in embedding_list],
         },
     }
 
@@ -91,6 +459,7 @@ def _extract_features(audio_path: str) -> Dict[str, Any]:
 async def analyze(
     source_url: Optional[AnyHttpUrl] = Form(None),
     file: Optional[UploadFile] = File(None),
+    track_id: Optional[str] = Form(None),
 ) -> JobWithResult:
     """
     Start an analysis job.
@@ -122,7 +491,7 @@ async def analyze(
                 detail="`source_url` handling is not implemented yet. Upload a file instead.",
             )
 
-        features = _extract_features(temp_path)
+        features = _extract_features(temp_path, track_id=track_id)
 
         job.status = JobStatus.completed
         job.completed_at = datetime.utcnow()
