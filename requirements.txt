@@ -1,5 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
-numpy==1.26.4
 python-multipart
+numpy==1.26.4
+essentia==2.1b6.dev1034
+essentia-tensorflow==2.1b6.dev1034
