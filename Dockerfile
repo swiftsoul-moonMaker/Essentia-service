@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.9-slim
 
 # Install system dependencies required by Essentia and FFmpeg
 RUN apt-get update && \
