@@ -16,13 +16,10 @@ RUN pip install --upgrade pip && \
     pip install numpy==1.26.4 fastapi uvicorn[standard] pydantic python-multipart
 
 RUN curl -L \
-      "https://files.pythonhosted.org/packages/9e/30/8e3306ef13584cf3e4fcd7c2430c5c592c23c23bc65d58c0fd6e22ee6c73/essentia-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-      -o /tmp/essentia-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl \
-   && curl -L \
       "https://files.pythonhosted.org/packages/21/c1/302af923c626b90e4f5ef0cfae4a8f97cb65f00f8d8cb646cf797e72f696/essentia_tensorflow-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-      -o /tmp/essentia_tensorflow-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl \
-   && pip install /tmp/essentia-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl /tmp/essentia_tensorflow-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl \
-   && rm -f /tmp/essentia-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl /tmp/essentia_tensorflow-2.1b6.dev1389-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+      -o /tmp/essentia_tf.whl \
+   && pip install /tmp/essentia_tf.whl \
+   && rm -f /tmp/essentia_tf.whl
 
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.9/site-packages/essentia_tensorflow:$LD_LIBRARY_PATH
 
