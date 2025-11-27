@@ -15,6 +15,12 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
+# Install Essentia and Essentia TensorFlow wheels with TF operators (cp39 manylinux2014)
+RUN pip install --no-cache-dir \
+    https://github.com/MTG/essentia/releases/download/v2.1_beta5/essentia-2.1b6.dev1034-cp39-cp39-manylinux2014_x86_64.whl && \
+    pip install --no-cache-dir \
+    https://github.com/MTG/essentia/releases/download/v2.1_beta5/essentia_tensorflow-2.1b6.dev1034-cp39-cp39-manylinux2014_x86_64.whl
+
 COPY . .
 
 # Ensure TensorFlow model files are present (download if missing in repo)
