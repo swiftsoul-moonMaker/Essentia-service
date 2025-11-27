@@ -13,8 +13,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt && \
-    pip install --no-cache-dir "essentia-tensorflow==2.1b6.dev1034"
+    pip install -r requirements.txt
 
 COPY . .
 
