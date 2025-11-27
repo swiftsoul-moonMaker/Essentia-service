@@ -388,16 +388,6 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
         tags["genres"].extend(tf_tags["labels"])
     if tf_tags.get("mood_labels"):
         tags["moods"].extend(tf_tags["mood_labels"])
-    tf_debug = {
-        "tf_model": TF_MODEL_PATH,
-        "tf_labels_file": TF_LABELS_PATH,
-        "tf_scores": tf_tags["scores"],
-        "tf_mood_labels": tf_tags.get("mood_labels", []),
-        "tf_mood_scores": tf_tags.get("mood_scores", []),
-        "tf_all_scores": tf_tags.get("all_scores", []),
-        "tf_shape": tf_tags.get("shape"),
-        "tf_error": tf_tags.get("error"),
-    }
 
     # Deduplicate while keeping order
     tags["genres"] = list(dict.fromkeys(tags["genres"]))
@@ -449,7 +439,6 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
             "energy": energy,
             "danceability": danceability,
             "tags": tags,
-            "debug": tf_debug,
             "embedding": [float(x) for x in embedding_list],
         },
     }
