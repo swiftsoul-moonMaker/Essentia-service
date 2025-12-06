@@ -1,6 +1,7 @@
+import asyncio
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import os
 import json
@@ -13,6 +14,7 @@ import logging
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import AnyHttpUrl, BaseModel
+import threading
 
 _tf_import_error: Optional[Exception] = None
 try:
@@ -64,6 +66,17 @@ ANALYZER_NAME = (
 )
 TF_MODEL_PATH = os.getenv("ESSENTIA_TF_MODEL")
 TF_LABELS_PATH = os.getenv("ESSENTIA_TF_MODEL_LABELS")
+try:
+    _analysis_concurrency_raw = int(os.getenv("ANALYSIS_CONCURRENCY", "1"))
+except ValueError:
+    _analysis_concurrency_raw = 1
+ANALYSIS_CONCURRENCY = max(_analysis_concurrency_raw, 1)
+_tf_predictor_lock = threading.Lock()
+_tf_predictor: Optional[Any] = None
+_tf_predictor_labels: Optional[List[str]] = None
+_tf_predictor_error: Optional[str] = None
+_tf_predictor_kind: Optional[str] = None
+_analysis_semaphore = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
 logger = logging.getLogger("essentia_service")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
@@ -78,6 +91,7 @@ logger.info(
     hasattr(es, "TensorflowPredictMusiCNN") if es else False,
     hasattr(es, "TensorflowPredict") if es else False,
 )
+logger.info("Analysis concurrency set to %s (semaphore-guarded)", ANALYSIS_CONCURRENCY)
 
 app = FastAPI(
     title="Essentia Analysis Service",
@@ -90,6 +104,88 @@ app = FastAPI(
 
 # In-memory storage for demo purposes only
 _JOBS: Dict[str, JobWithResult] = {}
+
+
+def _load_tf_labels() -> List[str]:
+    """Load TensorFlow label file once and cache it."""
+    labels: List[str] = []
+    if TF_LABELS_PATH and os.path.exists(TF_LABELS_PATH):
+        try:
+            if TF_LABELS_PATH.endswith(".json"):
+                with open(TF_LABELS_PATH, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    if "labels" in payload:
+                        payload = payload["labels"]
+                    elif "classes" in payload:
+                        payload = payload["classes"]
+                if isinstance(payload, list):
+                    labels = [str(x) for x in payload]
+            else:
+                with open(TF_LABELS_PATH, "r", encoding="utf-8") as f:
+                    labels = [line.strip() for line in f if line.strip()]
+        except Exception as exc:
+            logger.warning("Failed to load TF labels from %s: %s", TF_LABELS_PATH, exc)
+            labels = []
+    return labels
+
+
+def _get_tf_predictor() -> Tuple[Optional[Any], List[str], Optional[str]]:
+    """
+    Lazily load and cache the TensorFlow predictor to avoid per-request allocations.
+    Returns (predictor, labels, error).
+    """
+    global _tf_predictor, _tf_predictor_labels, _tf_predictor_error, _tf_predictor_kind
+
+    if _tf_predictor is not None:
+        return _tf_predictor, _tf_predictor_labels or [], None
+    if _tf_predictor_error is not None:
+        return None, _tf_predictor_labels or [], _tf_predictor_error
+
+    if es is None or TF_MODEL_PATH is None:
+        _tf_predictor_error = "tf_disabled_or_no_model"
+        logger.warning("TF predictor disabled: es=%s model=%s", es is not None, TF_MODEL_PATH)
+        return None, [], _tf_predictor_error
+    if not os.path.exists(TF_MODEL_PATH):
+        _tf_predictor_error = "model_not_found"
+        logger.error("TF model not found at %s", TF_MODEL_PATH)
+        return None, [], _tf_predictor_error
+    if not (hasattr(es, "TensorflowPredictMusiCNN") or hasattr(es, "TensorflowPredict")):
+        _tf_predictor_error = "tensorflow_not_available_in_this_essentia_build"
+        logger.error("TensorflowPredict/TensorflowPredictMusiCNN not available in essentia build")
+        return None, [], _tf_predictor_error
+
+    with _tf_predictor_lock:
+        # Double-check inside the lock in case another thread raced to load.
+        if _tf_predictor is None and _tf_predictor_error is None:
+            try:
+                if hasattr(es, "TensorflowPredictMusiCNN"):
+                    _tf_predictor = es.TensorflowPredictMusiCNN(
+                        graphFilename=TF_MODEL_PATH,
+                        output="model/Sigmoid",
+                    )
+                    _tf_predictor_kind = "musicnn"
+                else:
+                    _tf_predictor = es.TensorflowPredict(
+                        graphFilename=TF_MODEL_PATH,
+                        input="model/Placeholder",
+                        output="model/Sigmoid",
+                        m2f="melspectrogram",
+                    )
+                    _tf_predictor_kind = "generic"
+                _tf_predictor_labels = _load_tf_labels()
+                logger.info(
+                    "Loaded TensorFlow predictor once (kind=%s, labels=%s, path=%s)",
+                    _tf_predictor_kind,
+                    len(_tf_predictor_labels or []),
+                    TF_MODEL_PATH,
+                )
+            except Exception as exc:  # capture TensorFlow graph load failures
+                _tf_predictor_error = str(exc)
+                _tf_predictor = None
+                logger.exception("TF predictor init failed: %s", exc)
+
+    return _tf_predictor, _tf_predictor_labels or [], _tf_predictor_error
 
 
 def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[str, Any]:
@@ -249,59 +345,43 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
 
     # Tensorflow model-based tags (musicnn-style)
     def _tf_top_tags(audio_seq: Optional[List[float]]) -> Dict[str, Any]:
-        if es is None or TF_MODEL_PATH is None or audio_seq is None:
-            logger.warning("TF disabled or missing input: es=%s model=%s audio=%s", es is not None, TF_MODEL_PATH, audio_seq is not None)
-            return {"labels": [], "scores": [], "mood_labels": [], "shape": None, "error": "tf_disabled_or_no_audio"}
-        if not os.path.exists(TF_MODEL_PATH):
-            logger.error("TF model not found at %s", TF_MODEL_PATH)
-            return {"labels": [], "scores": [], "mood_labels": [], "shape": None, "error": "model_not_found"}
-        if not (hasattr(es, "TensorflowPredictMusiCNN") or hasattr(es, "TensorflowPredict")):
-            logger.error("TensorflowPredict/TensorflowPredictMusiCNN not available in essentia build")
+        if audio_seq is None:
+            logger.warning(
+                "TF disabled or missing input: es=%s model=%s audio=%s",
+                es is not None,
+                TF_MODEL_PATH,
+                False,
+            )
             return {
                 "labels": [],
                 "scores": [],
                 "mood_labels": [],
+                "mood_scores": [],
+                "all_scores": [],
                 "shape": None,
-                "error": "tensorflow_not_available_in_this_essentia_build",
+                "error": "tf_disabled_or_no_audio",
+            }
+
+        tf_predict, labels, predictor_error = _get_tf_predictor()
+        if tf_predict is None:
+            return {
+                "labels": [],
+                "scores": [],
+                "mood_labels": [],
+                "mood_scores": [],
+                "all_scores": [],
+                "shape": None,
+                "error": predictor_error or "tf_predictor_unavailable",
             }
         try:
-            if hasattr(es, "TensorflowPredictMusiCNN"):
-                tf_predict = es.TensorflowPredictMusiCNN(
-                    graphFilename=TF_MODEL_PATH,
-                    output="model/Sigmoid",
-                )
-            else:
-                tf_predict = es.TensorflowPredict(
-                    graphFilename=TF_MODEL_PATH,
-                    input="model/Placeholder",
-                    output="model/Sigmoid",
-                    m2f="melspectrogram",
-                )
-
-            activations = tf_predict(np.asarray(audio_seq, dtype=np.float32))
+            audio_arr = np.asarray(audio_seq, dtype=np.float32)
+            # Essentia's TF predictor bindings are not thread-safe; serialize access.
+            with _tf_predictor_lock:
+                activations = tf_predict(audio_arr)
             act_arr = np.asarray(activations, dtype=np.float32)
             if act_arr.ndim > 1:
                 act_arr = act_arr.mean(axis=0)
-            labels: List[str] = []
-            if TF_LABELS_PATH and os.path.exists(TF_LABELS_PATH):
-                if TF_LABELS_PATH.endswith(".json"):
-                    with open(TF_LABELS_PATH, "r", encoding="utf-8") as f:
-                        try:
-                            payload = json.load(f)
-                            if isinstance(payload, dict):
-                                if "labels" in payload:
-                                    payload = payload["labels"]
-                                elif "classes" in payload:
-                                    payload = payload["classes"]
-                            if isinstance(payload, list):
-                                labels = [str(x) for x in payload]
-                        except Exception:
-                            labels = []
-                else:
-                    with open(TF_LABELS_PATH, "r", encoding="utf-8") as f:
-                        labels = [line.strip() for line in f if line.strip()]
-            if not labels:
-                labels = [f"tag_{i}" for i in range(act_arr.shape[-1])]
+            labels = labels or [f"tag_{i}" for i in range(act_arr.shape[-1])]
 
             all_scores = []
             for i, lbl in enumerate(labels):
@@ -486,56 +566,67 @@ async def analyze(
     if source_url is None and file is None:
         raise HTTPException(status_code=400, detail="Provide either `file` or `source_url`.")
 
-    job_id = str(uuid4())
-    job = JobWithResult(
-        job_id=job_id,
-        status=JobStatus.running,
-        created_at=datetime.utcnow(),
-    )
-    _JOBS[job_id] = job
-
-    temp_path: Optional[str] = None
-    try:
-        if file is not None:
-            suffix = os.path.splitext(file.filename or "")[1] or ".audio"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                temp_path = tmp.name
-                shutil.copyfileobj(file.file, tmp)
-        else:
-            # You can implement URL downloading here using httpx/requests if desired.
-            raise HTTPException(
-                status_code=501,
-                detail="`source_url` handling is not implemented yet. Upload a file instead.",
+    # Serialize heavy analyses to keep memory bounded; excess requests wait on the semaphore.
+    wait_started = datetime.utcnow()
+    async with _analysis_semaphore:
+        wait_ms = int((datetime.utcnow() - wait_started).total_seconds() * 1000)
+        if wait_ms > 0:
+            logger.info(
+                "Request waited %sms in analysis queue (capacity=%s)",
+                wait_ms,
+                ANALYSIS_CONCURRENCY,
             )
 
-        features = _extract_features(temp_path, track_id=track_id)
-
-        job.status = JobStatus.completed
-        job.completed_at = datetime.utcnow()
-        job.result = features
-        _JOBS[job_id] = job
-
-        return job
-
-    except HTTPException as http_exc:
-        job.status = JobStatus.failed
-        job.completed_at = datetime.utcnow()
-        job.error = (
-            http_exc.detail if isinstance(http_exc.detail, str) else str(http_exc.detail)
+        job_id = str(uuid4())
+        job = JobWithResult(
+            job_id=job_id,
+            status=JobStatus.running,
+            created_at=datetime.utcnow(),
         )
         _JOBS[job_id] = job
-        raise
 
-    except Exception as exc:
-        job.status = JobStatus.failed
-        job.completed_at = datetime.utcnow()
-        job.error = str(exc)
-        _JOBS[job_id] = job
-        raise HTTPException(status_code=500, detail=str(exc))
+        temp_path: Optional[str] = None
+        try:
+            if file is not None:
+                suffix = os.path.splitext(file.filename or "")[1] or ".audio"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    temp_path = tmp.name
+                    shutil.copyfileobj(file.file, tmp)
+            else:
+                # You can implement URL downloading here using httpx/requests if desired.
+                raise HTTPException(
+                    status_code=501,
+                    detail="`source_url` handling is not implemented yet. Upload a file instead.",
+                )
 
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+            features = _extract_features(temp_path, track_id=track_id)
+
+            job.status = JobStatus.completed
+            job.completed_at = datetime.utcnow()
+            job.result = features
+            _JOBS[job_id] = job
+
+            return job
+
+        except HTTPException as http_exc:
+            job.status = JobStatus.failed
+            job.completed_at = datetime.utcnow()
+            job.error = (
+                http_exc.detail if isinstance(http_exc.detail, str) else str(http_exc.detail)
+            )
+            _JOBS[job_id] = job
+            raise
+
+        except Exception as exc:
+            job.status = JobStatus.failed
+            job.completed_at = datetime.utcnow()
+            job.error = str(exc)
+            _JOBS[job_id] = job
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
 @app.get("/jobs/{job_id}", response_model=JobWithResult, tags=["analysis"])
