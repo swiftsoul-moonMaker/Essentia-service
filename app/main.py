@@ -238,37 +238,38 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
     raw_audio = raw_loader()
     tf_audio: Optional[List[List[float]]] = None
     if TF_TAGS_ENABLED and TF_MODEL_PATH:
+        tf_loader = es.MonoLoader(
+            filename=audio_path,
+            sampleRate=16000,
+        )
+        tf_full_audio = list(tf_loader())
         tf_audio = []
-        try:
-            total_seconds = float(len(raw_audio) / 44100.0)
-        except Exception:
-            total_seconds = 0.0
-        starts: List[float] = [0.0]
-        if total_seconds > TF_AUDIO_SECONDS:
-            mid = max((total_seconds - TF_AUDIO_SECONDS) / 2.0, 0.0)
-            end = max(total_seconds - TF_AUDIO_SECONDS, 0.0)
-            starts.extend([mid, end])
-        # Keep only the first N unique start positions as configured.
-        seen = set()
-        filtered_starts: List[float] = []
-        for s in starts:
-            key = round(s, 3)
-            if key in seen:
-                continue
-            seen.add(key)
-            filtered_starts.append(s)
-            if len(filtered_starts) >= TF_AUDIO_WINDOWS:
-                break
+        sr = 16000
+        window_samples = int(TF_AUDIO_SECONDS * sr)
+        total_samples = len(tf_full_audio)
+        if total_samples == 0 or window_samples <= 0:
+            tf_audio = None
+        else:
+            starts: List[int] = [0]
+            if total_samples > window_samples:
+                mid = max((total_samples - window_samples) // 2, 0)
+                end = max(total_samples - window_samples, 0)
+                starts.extend([mid, end])
+            # Keep only the first N unique start positions as configured.
+            seen = set()
+            filtered_starts: List[int] = []
+            for s in starts:
+                if s in seen:
+                    continue
+                seen.add(s)
+                filtered_starts.append(s)
+                if len(filtered_starts) >= TF_AUDIO_WINDOWS:
+                    break
 
-        for start in filtered_starts:
-            tf_loader = es.MonoLoader(
-                filename=audio_path,
-                sampleRate=16000,
-                startTime=float(max(start, 0.0)),
-                # Limit duration to keep TF memory bounded; configurable via env.
-                duration=float(TF_AUDIO_SECONDS),
-            )
-            tf_audio.append(list(tf_loader()))
+            for start in filtered_starts:
+                end = min(start + window_samples, total_samples)
+                segment = tf_full_audio[start:end]
+                tf_audio.append(segment)
 
     # Run Essentia's high-level extractor (computes lowlevel, rhythm, tonal, and highlevel)
     music_extractor = es.MusicExtractor(
