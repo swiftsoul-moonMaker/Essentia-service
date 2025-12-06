@@ -66,6 +66,28 @@ ANALYZER_NAME = (
 )
 TF_MODEL_PATH = os.getenv("ESSENTIA_TF_MODEL")
 TF_LABELS_PATH = os.getenv("ESSENTIA_TF_MODEL_LABELS")
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    val = os.getenv(name, default).strip().lower()
+    return val not in {"0", "false", "no", "off", ""}
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+TF_TAGS_ENABLED = _env_bool("ENABLE_TF_TAGS", "1")
+# Limit TF audio duration to reduce memory footprint; the musicnn model works on chunks.
+# Default lowered to 10s to stay within 2GB instances; override via TF_AUDIO_SECONDS if needed.
+TF_AUDIO_SECONDS = max(_env_float("TF_AUDIO_SECONDS", 10.0), 1.0)
+# How many TF windows to evaluate (start/mid/end) to improve coverage without huge allocations.
+TF_AUDIO_WINDOWS = max(_env_int("TF_AUDIO_WINDOWS", 2), 1)
 try:
     _analysis_concurrency_raw = int(os.getenv("ANALYSIS_CONCURRENCY", "1"))
 except ValueError:
@@ -90,6 +112,12 @@ logger.info(
     os.path.exists(TF_LABELS_PATH) if TF_LABELS_PATH else False,
     hasattr(es, "TensorflowPredictMusiCNN") if es else False,
     hasattr(es, "TensorflowPredict") if es else False,
+)
+logger.info(
+    "TF tags enabled=%s duration_limit=%ss windows=%s",
+    TF_TAGS_ENABLED,
+    TF_AUDIO_SECONDS,
+    TF_AUDIO_WINDOWS,
 )
 logger.info("Analysis concurrency set to %s (semaphore-guarded)", ANALYSIS_CONCURRENCY)
 
@@ -142,6 +170,10 @@ def _get_tf_predictor() -> Tuple[Optional[Any], List[str], Optional[str]]:
     if _tf_predictor_error is not None:
         return None, _tf_predictor_labels or [], _tf_predictor_error
 
+    if not TF_TAGS_ENABLED:
+        _tf_predictor_error = "tf_tags_disabled"
+        logger.info("TF predictor disabled by ENABLE_TF_TAGS=0")
+        return None, [], _tf_predictor_error
     if es is None or TF_MODEL_PATH is None:
         _tf_predictor_error = "tf_disabled_or_no_model"
         logger.warning("TF predictor disabled: es=%s model=%s", es is not None, TF_MODEL_PATH)
@@ -203,10 +235,36 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
     # Load raw audio for RMS/energy and TensorFlow tagging
     raw_loader = es.MonoLoader(filename=audio_path, sampleRate=44100)
     raw_audio = raw_loader()
-    tf_audio: Optional[List[float]] = None
-    if TF_MODEL_PATH:
-        tf_loader = es.MonoLoader(filename=audio_path, sampleRate=16000)
-        tf_audio = list(tf_loader())
+    tf_audio: Optional[List[List[float]]] = None
+    if TF_TAGS_ENABLED and TF_MODEL_PATH:
+        tf_audio = []
+        total_seconds = float(len(audio_vals) / 44100.0) if audio_vals else 0.0
+        starts: List[float] = [0.0]
+        if total_seconds > TF_AUDIO_SECONDS:
+            mid = max((total_seconds - TF_AUDIO_SECONDS) / 2.0, 0.0)
+            end = max(total_seconds - TF_AUDIO_SECONDS, 0.0)
+            starts.extend([mid, end])
+        # Keep only the first N unique start positions as configured.
+        seen = set()
+        filtered_starts: List[float] = []
+        for s in starts:
+            key = round(s, 3)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered_starts.append(s)
+            if len(filtered_starts) >= TF_AUDIO_WINDOWS:
+                break
+
+        for start in filtered_starts:
+            tf_loader = es.MonoLoader(
+                filename=audio_path,
+                sampleRate=16000,
+                startTime=float(max(start, 0.0)),
+                # Limit duration to keep TF memory bounded; configurable via env.
+                duration=float(TF_AUDIO_SECONDS),
+            )
+            tf_audio.append(list(tf_loader()))
 
     # Run Essentia's high-level extractor (computes lowlevel, rhythm, tonal, and highlevel)
     music_extractor = es.MusicExtractor(
@@ -344,7 +402,17 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
     energy = float(sum_sq)
 
     # Tensorflow model-based tags (musicnn-style)
-    def _tf_top_tags(audio_seq: Optional[List[float]]) -> Dict[str, Any]:
+    def _tf_top_tags(audio_seq: Optional[Any]) -> Dict[str, Any]:
+        if not TF_TAGS_ENABLED:
+            return {
+                "labels": [],
+                "scores": [],
+                "mood_labels": [],
+                "mood_scores": [],
+                "all_scores": [],
+                "shape": None,
+                "error": "tf_disabled",
+            }
         if audio_seq is None:
             logger.warning(
                 "TF disabled or missing input: es=%s model=%s audio=%s",
@@ -374,13 +442,36 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
                 "error": predictor_error or "tf_predictor_unavailable",
             }
         try:
-            audio_arr = np.asarray(audio_seq, dtype=np.float32)
-            # Essentia's TF predictor bindings are not thread-safe; serialize access.
-            with _tf_predictor_lock:
-                activations = tf_predict(audio_arr)
-            act_arr = np.asarray(activations, dtype=np.float32)
-            if act_arr.ndim > 1:
-                act_arr = act_arr.mean(axis=0)
+            sequences: List[np.ndarray] = []
+            if isinstance(audio_seq, (list, tuple, np.ndarray)) and audio_seq:
+                first = audio_seq[0]
+                if isinstance(first, (list, tuple, np.ndarray)):
+                    for seq in audio_seq:
+                        sequences.append(np.asarray(seq, dtype=np.float32))
+                else:
+                    sequences.append(np.asarray(audio_seq, dtype=np.float32))
+            if not sequences:
+                return {
+                    "labels": [],
+                    "scores": [],
+                    "mood_labels": [],
+                    "mood_scores": [],
+                    "all_scores": [],
+                    "shape": None,
+                    "error": "tf_no_audio",
+                }
+
+            activations_list: List[np.ndarray] = []
+            for audio_arr in sequences:
+                # Essentia's TF predictor bindings are not thread-safe; serialize access.
+                with _tf_predictor_lock:
+                    activations = tf_predict(audio_arr)
+                act_arr = np.asarray(activations, dtype=np.float32)
+                if act_arr.ndim > 1:
+                    act_arr = act_arr.mean(axis=0)
+                activations_list.append(act_arr)
+
+            act_arr = np.vstack(activations_list).mean(axis=0)
             labels = labels or [f"tag_{i}" for i in range(act_arr.shape[-1])]
 
             all_scores = []
