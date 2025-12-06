@@ -85,6 +85,7 @@ def _env_float(name: str, default: float) -> float:
 TF_TAGS_ENABLED = _env_bool("ENABLE_TF_TAGS", "1")
 # Limit TF audio duration to reduce memory footprint; the musicnn model works on chunks.
 # Default lowered to 10s to stay within 2GB instances; override via TF_AUDIO_SECONDS if needed.
+# TODO: Revisit TF_AUDIO_SECONDS/TF_AUDIO_WINDOWS to use longer coverage once more memory/CPU is available.
 TF_AUDIO_SECONDS = max(_env_float("TF_AUDIO_SECONDS", 10.0), 1.0)
 # How many TF windows to evaluate (start/mid/end) to improve coverage without huge allocations.
 TF_AUDIO_WINDOWS = max(_env_int("TF_AUDIO_WINDOWS", 2), 1)
@@ -238,7 +239,10 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
     tf_audio: Optional[List[List[float]]] = None
     if TF_TAGS_ENABLED and TF_MODEL_PATH:
         tf_audio = []
-        total_seconds = float(len(audio_vals) / 44100.0) if audio_vals else 0.0
+        try:
+            total_seconds = float(len(raw_audio) / 44100.0)
+        except Exception:
+            total_seconds = 0.0
         starts: List[float] = [0.0]
         if total_seconds > TF_AUDIO_SECONDS:
             mid = max((total_seconds - TF_AUDIO_SECONDS) / 2.0, 0.0)
