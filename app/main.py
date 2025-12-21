@@ -233,20 +233,18 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
             "in this environment to enable feature extraction."
         )
 
-    # Load raw audio for RMS/energy and TensorFlow tagging
-    raw_loader = es.MonoLoader(filename=audio_path, sampleRate=44100)
-    raw_audio = raw_loader()
-    tf_audio: Optional[List[List[float]]] = None
+    # Load TensorFlow audio (lower sample rate) for tagging; keep arrays to reduce memory.
+    tf_audio: Optional[List[np.ndarray]] = None
     if TF_TAGS_ENABLED and TF_MODEL_PATH:
         tf_loader = es.MonoLoader(
             filename=audio_path,
             sampleRate=16000,
         )
-        tf_full_audio = list(tf_loader())
+        tf_full_audio = np.asarray(tf_loader(), dtype=np.float32)
         tf_audio = []
         sr = 16000
         window_samples = int(TF_AUDIO_SECONDS * sr)
-        total_samples = len(tf_full_audio)
+        total_samples = int(tf_full_audio.shape[0])
         if total_samples == 0 or window_samples <= 0:
             tf_audio = None
         else:
@@ -268,8 +266,10 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
 
             for start in filtered_starts:
                 end = min(start + window_samples, total_samples)
-                segment = tf_full_audio[start:end]
+                # Copy the slice to avoid holding the full track in memory.
+                segment = tf_full_audio[start:end].copy()
                 tf_audio.append(segment)
+        del tf_full_audio
 
     # Run Essentia's high-level extractor (computes lowlevel, rhythm, tonal, and highlevel)
     music_extractor = es.MusicExtractor(
@@ -398,10 +398,14 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
         _get("lowlevel.spectral_energyband_high.mean", spectral_centroid)
     )
 
-    # Loudness and energy from raw audio
-    audio_vals = _flatten_numeric(raw_audio)
-    sum_sq = sum(x * x for x in audio_vals)
-    rms = float(math.sqrt(sum_sq / len(audio_vals)) if audio_vals else 0.0)
+    # Loudness and energy from raw audio (use array ops to avoid extra copies).
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size:
+        sum_sq = float(np.dot(audio, audio))
+        rms = float(math.sqrt(sum_sq / audio.size))
+    else:
+        sum_sq = 0.0
+        rms = 0.0
     rms_loudness = float(20 * math.log10(max(rms, 1e-12)))  # dBFS-ish scalar
     dynamic_range = _to_scalar(_get("dynamic_complexity", 0.0))
     energy = float(sum_sq)
