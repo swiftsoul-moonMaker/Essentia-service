@@ -233,6 +233,59 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
             "in this environment to enable feature extraction."
         )
 
+    def _flatten_numeric(value: Any) -> List[float]:
+        """Return a flat list of floats, best-effort, ignoring non-numerics."""
+        out: List[float] = []
+
+        def _walk(v: Any) -> None:
+            if v is None:
+                return
+            if isinstance(v, (float, int, np.floating, np.integer)):
+                try:
+                    out.append(float(v))
+                except Exception:
+                    return
+                return
+            # Skip plain strings/bytes
+            if isinstance(v, (str, bytes)):
+                return
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    _walk(item)
+                return
+            if isinstance(v, np.ndarray):
+                for item in v.ravel():
+                    _walk(item)
+                return
+            if isinstance(v, dict):
+                for item in v.values():
+                    _walk(item)
+                return
+            # Generic iterable (e.g., Essentia vector types)
+            if hasattr(v, "__iter__"):
+                try:
+                    for item in v:
+                        _walk(item)
+                    return
+                except Exception:
+                    pass
+            try:
+                out.append(float(v))
+            except Exception:
+                return
+
+        _walk(value)
+        return out
+
+    def _coerce_float_array(values: Any) -> np.ndarray:
+        """Convert Essentia/Numpy/list inputs into a 1D float32 array."""
+        if isinstance(values, np.ndarray):
+            return values.astype(np.float32, copy=False).ravel()
+        try:
+            return np.asarray(values, dtype=np.float32).ravel()
+        except (TypeError, ValueError):
+            return np.asarray(_flatten_numeric(values), dtype=np.float32)
+
     # Load TensorFlow audio (lower sample rate) for tagging; keep arrays to reduce memory.
     tf_audio: Optional[List[np.ndarray]] = None
     if TF_TAGS_ENABLED and TF_MODEL_PATH:
@@ -240,7 +293,7 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
             filename=audio_path,
             sampleRate=16000,
         )
-        tf_full_audio = np.asarray(tf_loader(), dtype=np.float32)
+        tf_full_audio = _coerce_float_array(tf_loader())
         tf_audio = []
         sr = 16000
         window_samples = int(TF_AUDIO_SECONDS * sr)
@@ -286,50 +339,6 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
             return pool[key]
         except Exception:
             return default
-
-    def _flatten_numeric(value: Any) -> List[float]:
-        """Return a flat list of floats, best-effort, ignoring non-numerics."""
-        out: List[float] = []
-
-        def _walk(v: Any) -> None:
-            if v is None:
-                return
-            if isinstance(v, (float, int, np.floating, np.integer)):
-                try:
-                    out.append(float(v))
-                except Exception:
-                    return
-                return
-            # Skip plain strings/bytes
-            if isinstance(v, (str, bytes)):
-                return
-            if isinstance(v, (list, tuple)):
-                for item in v:
-                    _walk(item)
-                return
-            if isinstance(v, np.ndarray):
-                for item in v.ravel():
-                    _walk(item)
-                return
-            if isinstance(v, dict):
-                for item in v.values():
-                    _walk(item)
-                return
-            # Generic iterable (e.g., Essentia vector types)
-            if hasattr(v, "__iter__"):
-                try:
-                    for item in v:
-                        _walk(item)
-                    return
-                except Exception:
-                    pass
-            try:
-                out.append(float(v))
-            except Exception:
-                return
-
-        _walk(value)
-        return out
 
     def _to_scalar(value: Any, default: float = 0.0) -> float:
         vals = _flatten_numeric(value)
@@ -399,7 +408,7 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
     )
 
     # Loudness and energy from raw audio (use array ops to avoid extra copies).
-    audio = np.asarray(audio, dtype=np.float32)
+    audio = _coerce_float_array(audio)
     if audio.size:
         sum_sq = float(np.dot(audio, audio))
         rms = float(math.sqrt(sum_sq / audio.size))
