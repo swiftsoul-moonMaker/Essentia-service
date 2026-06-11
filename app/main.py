@@ -331,7 +331,9 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
         tonalStats=["mean", "var"],
         analysisSampleRate=44100,
     )
-    pool, audio = music_extractor(audio_path)
+    # NOTE: the second return value is a Pool of frame stats, NOT raw audio.
+    # Do not feed it to the RMS/energy math (that was the 6770701 regression).
+    pool, _frames_pool = music_extractor(audio_path)
     descriptor_names = set(pool.descriptorNames())
 
     def _get(key: str, default: Any = None) -> Any:
@@ -369,13 +371,15 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
 
     # Core scalar features
     tempo = _to_scalar(_get("rhythm.bpm", 0.0))
-    beat_strength = _safe_mean(_flatten_numeric(_get("rhythm.beats_loudness", [])))
+    beat_strength = _safe_mean(_flatten_numeric(_get("rhythm.beats_loudness.mean", [])))
     swing = _swing(_flatten_numeric(_get("rhythm.beats_position", [])))
-    danceability = _to_scalar(_get("rhythm.danceability", 0.0))
+    # Essentia Danceability is ~0-3; rescale to the 0-1 contract.
+    danceability_raw = _to_scalar(_get("rhythm.danceability", 0.0))
+    danceability = max(0.0, min(danceability_raw / 3.0, 1.0))
 
-    key_key = _get("tonal.key_key", "C")
-    key_scale = _get("tonal.key_scale", "major")
-    key_strength = _to_scalar(_get("tonal.key_strength", 0.0))
+    key_key = _get("tonal.key_edma.key", "C")
+    key_scale = _get("tonal.key_edma.scale", "major")
+    key_strength = _to_scalar(_get("tonal.key_edma.strength", 0.0))
     key_map = {
         "C": 0,
         "C#": 1,
@@ -400,24 +404,29 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
 
     hpcp_mean = [float(x) for x in _flatten_numeric(_get("tonal.hpcp.mean", []))]
     mfcc_mean = [float(x) for x in _flatten_numeric(_get("lowlevel.mfcc.mean", []))]
-    mfcc_var = [float(x) for x in _flatten_numeric(_get("lowlevel.mfcc.var", []))]
+    # MusicExtractor exposes the MFCC covariance matrix (13x13), not a plain variance
+    # vector. Use its diagonal as the per-coefficient variance to keep 13 dims.
+    _mfcc_cov_arr = np.asarray(_flatten_numeric(_get("lowlevel.mfcc.cov", [])), dtype=np.float32)
+    _mfcc_n = math.isqrt(int(_mfcc_cov_arr.size))
+    if _mfcc_n > 0 and _mfcc_n * _mfcc_n == _mfcc_cov_arr.size:
+        mfcc_var = [float(x) for x in _mfcc_cov_arr.reshape(_mfcc_n, _mfcc_n).diagonal()]
+    else:
+        mfcc_var = [float(x) for x in _mfcc_cov_arr]
 
     spectral_centroid = _to_scalar(_get("lowlevel.spectral_centroid.mean", 0.0))
     brightness = _to_scalar(
         _get("lowlevel.spectral_energyband_high.mean", spectral_centroid)
     )
 
-    # Loudness and energy from raw audio (use array ops to avoid extra copies).
-    audio = _coerce_float_array(audio)
-    if audio.size:
-        sum_sq = float(np.dot(audio, audio))
-        rms = float(math.sqrt(sum_sq / audio.size))
-    else:
-        sum_sq = 0.0
-        rms = 0.0
-    rms_loudness = float(20 * math.log10(max(rms, 1e-12)))  # dBFS-ish scalar
-    dynamic_range = _to_scalar(_get("dynamic_complexity", 0.0))
-    energy = float(sum_sq)
+    # Loudness/energy come straight from MusicExtractor's pool. Previously these were
+    # computed from the extractor's 2nd return value (a Pool, not audio), which floored
+    # energy to 0.0 and rms_loudness to -240.0 (regression 6770701).
+    average_loudness = _to_scalar(_get("lowlevel.average_loudness", 0.0))  # already 0-1
+    energy = float(max(0.0, min(average_loudness, 1.0)))
+    loudness = _to_scalar(_get("lowlevel.loudness_ebu128.integrated", 0.0))  # LUFS dB
+    # Keep rms_loudness for backward compat; consumers should prefer `loudness`.
+    rms_loudness = float(20 * math.log10(max(average_loudness, 1e-12)))  # dBFS-ish proxy
+    dynamic_range = _to_scalar(_get("lowlevel.dynamic_complexity", 0.0))
 
     # Tensorflow model-based tags (musicnn-style)
     def _tf_top_tags(audio_seq: Optional[Any]) -> Dict[str, Any]:
@@ -606,6 +615,25 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
     if tf_tags.get("mood_labels"):
         tags["moods"].extend(tf_tags["mood_labels"])
 
+    # First-pass valence/acousticness straight off the MusiCNN sigmoid (50 MSD tags):
+    #   acousticness = p(acoustic);  valence = p(happy) / (p(happy) + p(sad)).
+    # Returns null when the TF model is unavailable. A more accurate version can later
+    # add the mood_acoustic-musicnn-msd-2 / deam-musicnn-msd-2 transfer heads on the
+    # MusiCNN embedding node (model/dense/BiasAdd).
+    _tf_scores = {
+        str(item.get("label", "")).strip().lower(): float(item.get("score", 0.0))
+        for item in tf_tags.get("all_scores", [])
+    }
+    p_acoustic = _tf_scores.get("acoustic")
+    p_happy = _tf_scores.get("happy")
+    p_sad = _tf_scores.get("sad")
+    acousticness = float(p_acoustic) if p_acoustic is not None else None
+    if p_happy is None:
+        valence = None
+    else:
+        _val_denom = p_happy + (p_sad or 0.0)
+        valence = float(p_happy / _val_denom) if _val_denom > 1e-9 else float(p_happy)
+
     # Deduplicate while keeping order
     tags["genres"] = list(dict.fromkeys(tags["genres"]))
     tags["moods"] = list(dict.fromkeys(tags["moods"]))
@@ -652,8 +680,11 @@ def _extract_features(audio_path: str, track_id: Optional[str] = None) -> Dict[s
             "spectral_centroid": spectral_centroid,
             "brightness": brightness,
             "rms_loudness": rms_loudness,
+            "loudness": loudness,
             "dynamic_range": dynamic_range,
             "energy": energy,
+            "valence": valence,
+            "acousticness": acousticness,
             "danceability": danceability,
             "tags": tags,
             "embedding": [float(x) for x in embedding_list],
